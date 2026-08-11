@@ -8,7 +8,7 @@
 
 M5Canvas sprite(&M5.Display);
 Preferences prefs;
-AsyncWebServer server(80);  // ← ТЕПЕРЬ АСИНХРОННЫЙ
+AsyncWebServer server(80);
 
 const int SCREEN_W = 240;
 const int SCREEN_H = 135;
@@ -17,7 +17,7 @@ const int FACE_SIZE = 12;
 // ---------- WI-FI ----------
 const char* WIFI_SSID = "WRENCH_DEDSEC";
 const char* WIFI_PASS = "dedsec2016";
-const unsigned long WIFI_TIMEOUT_MS = 300000;  
+const unsigned long WIFI_TIMEOUT_MS = 300000;  // 5 мин без запросов -> выкл
 bool wifiActive = false;
 unsigned long lastWebMs = 0;
 bool aLongUsed = false;
@@ -53,6 +53,7 @@ enum LookState { LOOK_NONE, LOOK_LEFT, LOOK_RIGHT };
 LookState lookState = LOOK_NONE;
 unsigned long lookStart = 0;
 
+// ---------- МИКРОФОН ----------
 float micSens = 0.5;
 int thLow = 40, thHigh = 200, scareEnterPct = 66, bright = 180;
 const int SCARE_EXIT_PCT = 40;
@@ -74,25 +75,37 @@ unsigned long scareUntil = 0;
 unsigned long scareStart = 0;
 bool scareArmed = true;
 
+// ---------- IMU / CAR ----------
 const bool  SWAP_AXES  = true;
 const int   FWD_SIGN   = 1;
 const int   LAT_SIGN   = 1;
 const float VIB_TH     = 0.03;
 const float IMPACT_TH  = 0.9;
-const float BRAKE_TH   = 0.35;
-const float ACCEL_TH   = 0.28;
+const float BRAKE_TH   = 0.22;   // городское торможение ~0.2-0.4g
+const float ACCEL_TH   = 0.15;   // городской разгон ~0.15-0.3g
 const float GAZE_K     = 60.0;
 const unsigned long STILL_MS = 90000;
 
 float baseFwd = 0, baseLat = 0, carGaze = 0;
+float fwdSmooth = 0, latSmooth = 0;
+bool imuInited = false;
 bool carAsleep = false;
-bool carAccel = false;
+unsigned long accelUntil = 0;
 unsigned long lastMotionMs = 0;
 unsigned long brakeUntil = 0;
 unsigned long carScareUntil = 0;
 unsigned long carScareStart = 0;
 unsigned long carScareCooldown = 0;
 
+// ---------- КАЛИБРОВКА IMU «НА НОЛЬ» ----------
+bool calibActive = false;
+bool hasCalib = false;
+unsigned long calibStart = 0;
+float calibSumF = 0, calibSumL = 0;
+int calibN = 0;
+const unsigned long CALIB_MS = 1500;   // 1.5 сек стоим и собираем «ноль»
+
+// ---------- СОСТОЯНИЕ ----------
 Mode mode = M_AUTO;
 Emotion emotion = E_HAPPY;
 bool flipped = false;
@@ -190,8 +203,8 @@ void wifiOn() {
   delay(100);
   WiFi.softAP(WIFI_SSID, WIFI_PASS, 1, 0, 4);
   delay(500);
-  
-  server.begin();  // ← Запускаем асинхронный сервер
+
+  server.begin();
   wifiActive = true;
   lastWebMs = millis();
   showToast("WI-FI ON");
@@ -200,7 +213,7 @@ void wifiOn() {
 }
 
 void wifiOff() {
-  server.end();    // ← Останавливаем асинхронный сервер
+  server.end();
   WiFi.softAPdisconnect(true);
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
@@ -277,7 +290,7 @@ void micCategoryLogic(unsigned long now) {
   }
 }
 
-// ---------- IMU ----------
+// ---------- IMU: МАШИНА ЧУВСТВУЕТ + КАЛИБРОВКА ----------
 void updateImu(unsigned long now) {
   float ax, ay, az;
   if (!M5.Imu.getAccel(&ax, &ay, &az)) return;
@@ -286,9 +299,40 @@ void updateImu(unsigned long now) {
   float fwd = ry * FWD_SIGN;
   float lat = rx * LAT_SIGN;
 
-  baseFwd += (fwd - baseFwd) * 0.05;
-  baseLat += (lat - baseLat) * 0.05;
-  float dev = fabsf(fwd - baseFwd) + fabsf(lat - baseLat);
+  // первый кадр: если ручной калибровки не было — запоминаем текущий наклон
+  if (!imuInited) {
+    if (!hasCalib) { baseFwd = fwd; baseLat = lat; }
+    imuInited = true;
+  }
+
+  // быстрое сглаживание от шума датчика
+  fwdSmooth += (fwd - fwdSmooth) * 0.3;
+  latSmooth += (lat - latSmooth) * 0.3;
+
+  // КАЛИБРОВКА: 1.5 сек стоим, усредняем и запоминаем как «ноль»
+  if (calibActive) {
+    calibSumF += fwdSmooth;
+    calibSumL += latSmooth;
+    calibN++;
+    if (now - calibStart >= CALIB_MS && calibN > 0) {
+      baseFwd = calibSumF / calibN;
+      baseLat = calibSumL / calibN;
+      calibActive = false;
+      hasCalib = true;
+      prefs.putUChar("calib", 1);
+      prefs.putFloat("bf", baseFwd);
+      prefs.putFloat("bl", baseLat);
+      showToast("CALIB OK");
+    }
+    return;   // на время калибровки реакции приостановлены
+  }
+
+  // медленный базлайн: доедает только дрейф, но не разгон
+  baseFwd += (fwdSmooth - baseFwd) * 0.004;
+  baseLat += (latSmooth - baseLat) * 0.004;
+
+  float dF = fwdSmooth - baseFwd;
+  float dev = fabsf(dF) + fabsf(latSmooth - baseLat);
 
   if (dev > VIB_TH) lastMotionMs = now;
   if (dev > IMPACT_TH && now > carScareCooldown) {
@@ -299,11 +343,14 @@ void updateImu(unsigned long now) {
   }
 
   carAsleep = (now - lastMotionMs > STILL_MS);
-  if (fwd - baseFwd < -BRAKE_TH) brakeUntil = now + 700;
-  carAccel = (fwd - baseFwd > ACCEL_TH);
 
+  // тормоз / разгон с удержанием лица на 0.8 сек
+  if (dF < -BRAKE_TH) brakeUntil = now + 800;
+  if (dF > ACCEL_TH)  accelUntil = now + 800;
+
+  // взгляд в поворот
   if (!carAsleep) {
-    float target = constrain(lat * GAZE_K, -18.0, 18.0);
+    float target = constrain(latSmooth * GAZE_K, -18.0, 18.0);
     carGaze += (target - carGaze) * 0.2;
     gazeX = (int)carGaze;
   } else { carGaze = 0; gazeX = 0; }
@@ -327,6 +374,12 @@ void setup() {
   thHigh = prefs.getInt("th", 200);
   scareEnterPct = prefs.getInt("se", 66);
   bright = prefs.getInt("br", 180);
+
+  // сохранённая калибровка IMU
+  hasCalib = prefs.getUChar("calib", 0) == 1;
+  baseFwd = prefs.getFloat("bf", 0);
+  baseLat = prefs.getFloat("bl", 0);
+
   M5.Display.setRotation(flipped ? 3 : 1);
   M5.Display.setBrightness(bright);
 
@@ -342,7 +395,7 @@ void setup() {
     lastWebMs = millis();
     String html = String(INDEX_HTML);
     size_t logoLen = strlen(LOGO_B64);
-    if (logoLen > 0 && logoLen < 200000) html.replace("__LOGO_B64__", LOGO_B64);
+    if (logoLen > 0 && logoLen < 100000) html.replace("__LOGO_B64__", LOGO_B64);
     request->send(200, "text/html", html);
   });
 
@@ -367,14 +420,19 @@ void setup() {
     if (request->hasParam("m")) { mode = (Mode)constrain(request->getParam("m")->value().toInt(), 0, M_COUNT - 1); prefs.putUChar("mode", (uint8_t)mode); scareUntil = 0; carScareUntil = 0; }
     if (request->hasParam("flip")) { flipped = !flipped; M5.Display.setRotation(flipped ? 3 : 1); prefs.putBool("flip", flipped); needRedraw = true; }
     if (request->hasParam("scare")) { scareStart = millis(); scareUntil = scareStart + SCARE_MS; }
-    
+    if (request->hasParam("calib")) {
+      calibActive = true;
+      calibStart = millis();
+      calibSumF = 0; calibSumL = 0; calibN = 0;
+    }
+
     bool save = false;
     if (request->hasParam("ms")) { micSens = request->getParam("ms")->value().toFloat(); save = true; }
     if (request->hasParam("tl")) { thLow = request->getParam("tl")->value().toInt(); save = true; }
     if (request->hasParam("th")) { thHigh = request->getParam("th")->value().toInt(); save = true; }
     if (request->hasParam("se")) { scareEnterPct = request->getParam("se")->value().toInt(); save = true; }
     if (request->hasParam("br")) { bright = request->getParam("br")->value().toInt(); M5.Display.setBrightness(bright); save = true; }
-    
+
     if (save) {
       prefs.putFloat("ms", micSens); prefs.putInt("tl", thLow); prefs.putInt("th", thHigh);
       prefs.putInt("se", scareEnterPct); prefs.putInt("br", bright);
@@ -401,7 +459,7 @@ void loop() {
   M5.update();
   unsigned long now = millis();
 
-  // Wi-Fi таймаут (handleClient больше не нужен, Async сам всё делает!)
+  // Wi-Fi таймаут (Async сам обрабатывает запросы)
   if (wifiActive) {
     if (now - lastWebMs > WIFI_TIMEOUT_MS) wifiOff();
   }
@@ -507,10 +565,15 @@ void loop() {
     } else if (mode == M_CAR) {
       if (carAsleep)             shown = E_SLEEPY;
       else if (now < brakeUntil) shown = E_ALERT;
-      else if (carAccel)         shown = E_PAIN;
+      else if (now < accelUntil) shown = E_PAIN;
     }
     drawEyes(shown, closed, bg);
     if (mode == M_MIC) drawVolumeBar();
+    if (calibActive) {
+      sprite.setTextSize(2);
+      sprite.fillRect(0, 0, SCREEN_W, 20, TFT_BLACK);
+      sprite.drawString("CALIB...", 8, 2);
+    }
     sprite.pushSprite(0, 0);
     needRedraw = false;
   }
