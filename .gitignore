@@ -1,10 +1,1 @@
-# PlatformIO
-.pio/
-
-# VS Code
-.vscode/
-*.code-workspace
-
-# System
-.DS_Store
-Thumbs.db
+Nothing should be ignored based on the provided file changes, as only a README.md file was modified and no build artifacts, dependencies, or temporary files were included in the changes.
